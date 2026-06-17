@@ -46,7 +46,14 @@ const SYSTEM = `Ты — Алексей, менеджер компании Hilso
 9. Переход — взять контакт, зафиксировать расчёт письменно
 
 ## Если клиент сразу дал много данных
-Не гони по воронке с нуля. Распознай что уже сказано (размеры, материал, форма, локация, фото), подтverди коротко и спроси только недостающее.
+Не гони по воронке с нуля. Распознай что уже сказано (размеры, материал, форма, локация, фото), подтверди коротко и спроси только недостающее.
+
+## Работа с фото и планами
+- Клиент может прислать план кухни, чертёж или фото помещения
+- С плана/чертежа извлекай: форму (прямая/Г/П), размеры по стенам, расположение мойки, варки, окна, углов
+- Проговори что понял с картинки и попроси подтвердить — не доверяй слепо, размеры с фото от руки уточняй
+- Если на плане есть цифры — читай их; если фото без размеров — определи форму и спроси размеры
+- С реального фото кухни точные размеры не бери, но форму и состав (где мойка, варка) понять можно
 
 ## Правила тона
 - Никаких «Отлично», «Прекрасно», «Замечательно», восклицательных знаков, комплиментов, удивлений
@@ -67,6 +74,22 @@ function getSession(chatId) {
     sessions[chatId] = { messages: [], startTime: new Date(), paused: false };
   }
   return sessions[chatId];
+}
+
+function downloadAsBase64(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, (res) => {
+      const chunks = [];
+      const contentType = res.headers['content-type'] || 'image/jpeg';
+      let mediaType = 'image/jpeg';
+      if (contentType.includes('png')) mediaType = 'image/png';
+      else if (contentType.includes('webp')) mediaType = 'image/webp';
+      else if (contentType.includes('gif')) mediaType = 'image/gif';
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => resolve({ base64: Buffer.concat(chunks).toString('base64'), mediaType }));
+      res.on('error', reject);
+    }).on('error', reject);
+  });
 }
 
 function askClaude(messages) {
@@ -142,11 +165,37 @@ bot.on('message', async (msg) => {
   if (text === '/resume') { session.paused = false; await bot.sendMessage(chatId, '(бот снова отвечает)'); return; }
   if (session.paused) return;
 
-  // Приём фото
+  // Приём фото — скачиваем и отправляем в Claude для распознавания
   if (msg.photo) {
-    session.messages.push({ role: 'user', content: '[клиент прислал фото проекта/кухни]' });
-    await bot.sendMessage(chatId, 'Фото получил, передам мастеру. Подскажите размеры по стене?');
-    session.messages.push({ role: 'assistant', content: 'Фото получил, передам мастеру. Подскажите размеры по стене?' });
+    bot.sendChatAction(chatId, 'typing');
+    try {
+      // Берём фото в максимальном разрешении (последнее в массиве)
+      const fileId = msg.photo[msg.photo.length - 1].file_id;
+      const fileLink = await bot.getFileLink(fileId);
+      const { base64, mediaType } = await downloadAsBase64(fileLink);
+
+      const caption = msg.caption ? msg.caption : '';
+
+      // Сообщение клиента с картинкой
+      session.messages.push({
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
+          { type: 'text', text: caption || 'Вот план/фото моего проекта.' }
+        ]
+      });
+
+      const reply = await askClaude(session.messages);
+      session.messages.push({ role: 'assistant', content: reply });
+
+      if (reply.includes('SEND_SUMMARY')) sendSummaryToManager(session, session.messages);
+
+      const clean = reply.replace(/\[STAGE:\d+\]/g, '').replace('SEND_SUMMARY', '').trim();
+      await bot.sendMessage(chatId, clean);
+    } catch (e) {
+      console.error('Ошибка обработки фото:', e);
+      await bot.sendMessage(chatId, 'Фото получил, но не смог разобрать детали. Подскажите размеры по стене?');
+    }
     return;
   }
 
