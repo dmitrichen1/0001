@@ -7,6 +7,32 @@ const MANAGER_CHAT_ID = process.env.MANAGER_CHAT_ID;
 
 const bot = new TelegramBot(TG_TOKEN, { polling: true });
 
+// Защита от дублей: ловим конфликт двойного polling
+bot.on('polling_error', (err) => {
+  if (err.code === 'ETELEGRAM' && /409/.test(err.message)) {
+    console.error('⚠️ Конфликт polling — запущен второй экземпляр бота с тем же токеном! Остановите лишний деплой.');
+  } else {
+    console.error('polling_error:', err.code, err.message);
+  }
+});
+
+// Отправка ответа несколькими сообщениями по разделителю |||
+async function sendSplit(chatId, text) {
+  const parts = text.split('|||').map(p => p.trim()).filter(Boolean);
+  for (let i = 0; i < parts.length; i++) {
+    if (i > 0) {
+      bot.sendChatAction(chatId, 'typing');
+      await new Promise(r => setTimeout(r, 700));
+    }
+    try {
+      await bot.sendMessage(chatId, parts[i], { parse_mode: 'Markdown' });
+    } catch (e) {
+      // если Markdown сломался на спецсимволах — шлём как обычный текст
+      await bot.sendMessage(chatId, parts[i]);
+    }
+  }
+}
+
 const SYSTEM = `Ты — Алексей, менеджер компании Hilson Stone по изготовлению столешниц и подоконников из камня. Общаешься в переписке — берёшь инициативу, ведёшь клиента, мягко двигаешь к решению. Обращайся на «вы», уважительно.
 
 ## О компании (факты)
@@ -26,6 +52,7 @@ const SYSTEM = `Ты — Алексей, менеджер компании Hilso
 - Размеры клиент даёт в см/мм/метрах — переводи в мм, проговаривай результат
 - Видимая толщина: стандарт 20 мм (можно утолщение до 40)
 - Пристеночный бортик / стеновая панель — уточняй, нужны ли
+- Кромка (торец): НЕ называй конкретный тип/маркировку (П-20, A-7 и т.п. различаются у разных производителей и путают). Говори просто: «кромка 20 мм, стандартная или фигурная». Если клиент сам назвал конкретную — фиксируй как сказал.
 
 ## Раскрой (важно!)
 - Клиенту НЕ выдавай жёсткие размеры деталей и место стыка. Габариты по стенам — да; деление на детали и стык — «определим при раскрое».
@@ -91,23 +118,43 @@ const SYSTEM = `Ты — Алексей, менеджер компании Hilso
 
 ## Тон
 - Обращение на «вы», уважительно
-- Без «Отлично», «Прекрасно», восклицаний, комплиментов, удивлений
+- Без «Отлично», «Прекрасно», восклицаний, удивлений
+- НЕ хвали выбор клиента и не оценивай его вкус («хорошо смотрится», «отличный тон» — нельзя). Если хочешь поддержать выбор — хвали камень или соотношение цена/качество, лаконично: «Аварус — ходовой камень, хорошая стоимость при достойном качестве». Коротко, без растекания.
 - Не повторяй дословно слова клиента
-- Коротко: 1-3 предложения + один вопрос
 - Инициатива у тебя, заканчивай вопросом
 - Точные цены на материалы пока не называй — только вилка «от и до»
 - Номер телефона от клиента — завершай и передавай менеджеру
 
+## Запрос контакта (важно — снять страх)
+Когда просишь телефон, всегда добавляй фразу про приватность, чтобы снять барьер: номер нужен только для расчёта, спам слать не будем, лишний раз звонить не будем, никому не передаём. Например: «Оставьте номер для расчёта — обещаю, спама и лишних звонков не будет, номер никому не передаём.»
+
+## Формат сообщений (важно)
+- НЕ пиши всё одним длинным сообщением. Разбивай на 2-3 коротких смысловых блока.
+- Раздели блоки маркером ||| (три вертикальных черты) — код отправит их отдельными сообщениями.
+- Каждый блок — законченная мысль: например, блок 1 «что понял по проекту», блок 2 «стоимость», блок 3 «вопрос».
+- Стоимость и ключевые цифры выделяй жирным через *звёздочки* (Telegram Markdown): *от 45 000 до 55 000 руб.*
+- Используй простую пунктуацию, читаемые фразы. Не нужно списков с кучей пунктов в одном сообщении — лучше короче и по делу.
+- Последний блок обычно заканчивается вопросом.
+
+## Подогрев молчащих клиентов
+Если клиент не ответил после твоего вопроса, ты можешь получить системную команду «напомни о себе». Тогда напиши короткое ненавязчивое сообщение, чтобы оживить диалог. Варьируй формулировки, не повторяйся:
+- «Подскажите, актуально ещё? Могу подготовить расчёт.»
+- «Если удобнее обсудить голосом — оставьте номер, наберу в рабочее время.»
+- «Остались вопросы по проекту? Готов помочь с выбором.»
+НЕ подогревай, если в диалоге клиент просил связаться по телефону или уже дал номер — с ним, скорее всего, уже работает менеджер.
+Подогрев должен быть один-два раза, не назойливо. Если клиент молчит и после — вежливо отступи: «Сохраните мой номер, как станет актуально — дайте знать.»
+
 Когда клиент дал контакт, диалог завершён, или это дальний заказ — добавь в конце: SEND_SUMMARY
 Когда уместно показать производство (клиент сомневается, сравнивает с дешёвым конкурентом, просит фото цеха) — добавь в конце: SEND_PRODUCTION
 Когда клиент спрашивает как ухаживать за камнем — добавь в конце: SEND_CARE
+Когда клиент спрашивает про варианты кромки / какие бывают торцы — добавь в конце: SEND_EDGES (для кварца/гранита/мрамора, 12 вариантов) или SEND_EDGES_AKRIL (для акрила, 4 варианта)
 В конце каждого ответа добавляй: [STAGE:N] где N от 0 до 8`;
 
 const sessions = {};
 
 function getSession(chatId) {
   if (!sessions[chatId]) {
-    sessions[chatId] = { messages: [], startTime: new Date(), paused: false };
+    sessions[chatId] = { messages: [], startTime: new Date(), paused: false, warmCount: 0, warmTimer: null, noWarm: false };
   }
   return sessions[chatId];
 }
@@ -213,6 +260,50 @@ async function sendCareGuide(chatId) {
   }
 }
 
+async function sendEdges(chatId, material) {
+  try {
+    const dir = path.join(__dirname, 'assets');
+    const file = material === 'akril' ? 'kromki_akril.jpg' : 'kromki_kvarc.jpg';
+    const caption = material === 'akril'
+      ? 'Варианты кромки для акрила — 4 профиля.'
+      : 'Варианты кромки для кварца, гранита и мрамора — 12 профилей.';
+    await bot.sendPhoto(chatId, path.join(dir, file), { caption });
+  } catch (e) {
+    console.error('Ошибка отправки фото кромок:', e);
+  }
+}
+
+// Подогрев: ставим таймер после ответа бота. Порог зависит от "горячести".
+// Для теста пороги короткие; в проде увеличить (warmDelays в минутах).
+const WARM_DELAYS_MS = [2 * 60 * 60 * 1000, 24 * 60 * 60 * 1000]; // 2 часа, затем сутки
+
+function scheduleWarmUp(chatId, session) {
+  if (session.warmTimer) clearTimeout(session.warmTimer);
+  if (session.noWarm || session.paused) return;
+  if (session.warmCount >= WARM_DELAYS_MS.length) return;
+
+  const delay = WARM_DELAYS_MS[session.warmCount];
+  session.warmTimer = setTimeout(async () => {
+    if (session.noWarm || session.paused) return;
+    session.warmCount++;
+    try {
+      // Просим модель сгенерировать подогрев в контексте диалога
+      const warmMsgs = session.messages.concat([{
+        role: 'user',
+        content: '[СИСТЕМА: клиент молчит уже некоторое время после твоего вопроса. Напомни о себе одним коротким ненавязчивым сообщением, чтобы оживить диалог. Не повторяй прежние формулировки.]'
+      }]);
+      const reply = await askClaude(warmMsgs);
+      const clean = reply.replace(/\[STAGE:\d+\]/g, '').replace(/SEND_\w+/g, '').replace(/\|\|\|/g, '\n').trim();
+      session.messages.push({ role: 'assistant', content: reply });
+      await sendSplit(chatId, clean);
+      // Планируем следующий подогрев (последний)
+      scheduleWarmUp(chatId, session);
+    } catch (e) {
+      console.error('Ошибка подогрева:', e);
+    }
+  }, delay);
+}
+
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
@@ -222,6 +313,10 @@ bot.on('message', async (msg) => {
   }
 
   const session = getSession(chatId);
+
+  // Клиент написал — сбрасываем таймер подогрева и счётчик
+  if (session.warmTimer) { clearTimeout(session.warmTimer); session.warmTimer = null; }
+  session.warmCount = 0;
 
   // Менеджер ставит диалог на паузу командой /stop, возвращает /resume
   if (text === '/stop') { session.paused = true; await bot.sendMessage(chatId, '(бот на паузе)'); return; }
@@ -254,7 +349,7 @@ bot.on('message', async (msg) => {
       if (reply.includes('SEND_SUMMARY')) sendSummaryToManager(session, session.messages);
 
       const clean = reply.replace(/\[STAGE:\d+\]/g, '').replace('SEND_SUMMARY', '').trim();
-      await bot.sendMessage(chatId, clean);
+      await sendSplit(chatId, clean);
     } catch (e) {
       console.error('Ошибка обработки фото:', e);
       await bot.sendMessage(chatId, 'Фото получил, но не смог разобрать детали. Подскажите размеры по стене?');
@@ -290,13 +385,32 @@ bot.on('message', async (msg) => {
       sendCareGuide(chatId);
     }
 
+    if (reply.includes('SEND_EDGES_AKRIL')) {
+      sendEdges(chatId, 'akril');
+    } else if (reply.includes('SEND_EDGES')) {
+      sendEdges(chatId, 'kvarc');
+    }
+
     const clean = reply
       .replace(/\[STAGE:\d+\]/g, '')
       .replace('SEND_SUMMARY', '')
       .replace('SEND_PRODUCTION', '')
       .replace('SEND_CARE', '')
+      .replace('SEND_EDGES_AKRIL', '')
+      .replace('SEND_EDGES', '')
+      .replace(/\|\|\|\s*$/, '')
       .trim();
-    await bot.sendMessage(chatId, clean);
+    await sendSplit(chatId, clean);
+
+    // Если клиент дал номер или речь зашла о звонке — отключаем подогрев (менеджер свяжется сам)
+    const phoneRe = /\+?[78][\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}/;
+    const callRe = /(по телефону|перезвон|наберите|позвон|голос)/i;
+    if (phoneRe.test(text) || callRe.test(text) || reply.includes('SEND_SUMMARY')) {
+      session.noWarm = true;
+      if (session.warmTimer) { clearTimeout(session.warmTimer); session.warmTimer = null; }
+    } else {
+      scheduleWarmUp(chatId, session);
+    }
   } catch (e) {
     console.error('Ошибка:', e);
     await bot.sendMessage(chatId, 'Технический сбой, попробуйте через минуту.');
