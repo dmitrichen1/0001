@@ -472,6 +472,12 @@ bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
 
+  // /myid — узнать свой chat_id (для настройки MANAGER_CHAT_ID)
+  if (text === '/myid') {
+    await bot.sendMessage(chatId, `Ваш chat_id: ${chatId}\nТип чата: ${msg.chat.type}\n\nЕсли это ваш личный чат — впишите этот ID в Railway → Variables → MANAGER_CHAT_ID, чтобы сводки и тревоги приходили сюда.`);
+    return;
+  }
+
   // ─── Команды менеджера (из личного чата владельца) ───────────────
   if (MANAGER_CHAT_ID && String(chatId) === String(MANAGER_CHAT_ID) && text) {
     // Режим ответа клиенту по кнопке: следующее сообщение уходит выбранному клиенту
@@ -536,6 +542,15 @@ bot.on('message', async (msg) => {
   // запоминаем имя клиента из Telegram для кнопок менеджера
   if (!session.clientName && msg.from) {
     session.clientName = [msg.from.first_name, msg.from.last_name].filter(Boolean).join(' ') || (msg.from.username ? '@'+msg.from.username : null) || `клиент ${chatId}`;
+  }
+  // username (@ник) для связи
+  if (!session.clientUsername && msg.from && msg.from.username) {
+    session.clientUsername = '@' + msg.from.username;
+  }
+  // ловим телефон, если клиент написал его в диалоге
+  if (text) {
+    const phoneM = text.match(/\+?[78][\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}/);
+    if (phoneM) session.clientPhone = phoneM[0];
   }
 
   // Клиент написал — сбрасываем таймер подогрева и счётчик
@@ -642,9 +657,15 @@ bot.on('message', async (msg) => {
             ? `*${lo.toLocaleString('ru-RU')} ₽*`
             : `*${lo.toLocaleString('ru-RU')}–${hi.toLocaleString('ru-RU')} ₽*`;
           calcInsert = priceStr;
-          // внутренняя сводка менеджеру: раскрой, прибыль
+          // внутренняя сводка менеджеру: раскрой, прибыль, контакты
           if (MANAGER_CHAT_ID) {
-            const summary = `💰 Расчёт для ${session.clientName || chatId}\n` +
+            const contacts = [
+              session.clientUsername ? `Ник: ${session.clientUsername}` : null,
+              session.clientPhone ? `Тел: ${session.clientPhone}` : null,
+              `ID: ${chatId}`
+            ].filter(Boolean).join(' · ');
+            const summary = `💰 Расчёт — ${session.clientName || chatId}\n` +
+              `${contacts}\n` +
               `Раскрой: ${est.cut.desc} (увер. ${Math.round(est.confidence*100)}%)\n` +
               `Цена клиенту: ${lo===hi?lo:lo+'–'+hi} ₽\n` +
               `Грязная прибыль: ${est.profit.toLocaleString('ru-RU')} ₽ (${est.profitPct}%)`;
