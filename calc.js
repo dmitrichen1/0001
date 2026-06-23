@@ -65,13 +65,30 @@ async function workingRate(currency) {
 
 // ─── Поиск камня по названию/артикулу ────────────────────────────
 function normalize(s) { return (s || '').toLowerCase().replace(/ё/g, 'е').trim(); }
+// слова-шум, которые клиент/бот добавляют, но они мешают поиску
+const NOISE_WORDS = ['аварус','авант','авангард','нобл','ноble','noble','quartz','кварц','цезарь','caesarstone','цезарстоун',
+  'глянец','глянцевый','матовый','мат','полированный','камень','столешница','коллекция','авант кварц','avarus','avant'];
 function findStone(query) {
-  const q = normalize(query);
-  return PRICE.filter(p =>
-    normalize(p.name).includes(q) ||
-    normalize(p.article).includes(q) ||
-    normalize(p.brand).includes(q)
+  let q = normalize(query);
+  // прямое совпадение
+  let result = PRICE.filter(p =>
+    normalize(p.name).includes(q) || normalize(p.article).includes(q) || normalize(p.brand).includes(q)
   );
+  if (result.length) return result;
+  // убираем шумовые слова и пробуем по оставшимся ключевым словам
+  let words = q.split(/\s+/).filter(w => w && !NOISE_WORDS.includes(w));
+  if (words.length) {
+    const cleaned = words.join(' ');
+    result = PRICE.filter(p => normalize(p.name).includes(cleaned));
+    if (result.length) return result;
+    // совпадение по всем оставшимся словам в названии (в любом порядке)
+    result = PRICE.filter(p => {
+      const name = normalize(p.name);
+      return words.every(w => name.includes(w));
+    });
+    if (result.length) return result;
+  }
+  return [];
 }
 
 // ─── Расчёт стоимости материала ──────────────────────────────────
