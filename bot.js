@@ -1,5 +1,6 @@
 const TelegramBot = require('node-telegram-bot-api');
 const https = require('https');
+const calc = require('./calc.js');
 
 const TG_TOKEN = process.env.TG_TOKEN;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY;
@@ -209,6 +210,45 @@ const SYSTEM = `Ты — Алексей, менеджер компании Hilso
 НЕ подогревай, если в диалоге клиент просил связаться по телефону или уже дал номер — с ним, скорее всего, уже работает менеджер.
 Подогрев должен быть один-два раза, не назойливо. Если клиент молчит и после — вежливо отступи: «Сохраните мой номер, как станет актуально — дайте знать.»
 
+## Работа с возражениями и сопротивлением клиента
+ЦЕНА:
+- «Дорого» / «у других дешевле» → «Пришлите лучшее предложение, что у вас на руках — постараюсь дать ещё лучше, вам это ничего не стоит. Возможно, у них посчитан меньший объём материала.» Не оправдывайся, держись уверенно.
+- «Почему так дорого?» → объясни лаконично: цена под ключ (материал + изготовление + замер + доставка + монтаж), качество, гарантия. Без длинных оправданий.
+- «Это точная цена?» → «Предварительная. Всё зависит от точного раскроя деталей. Если хотите — расчерчу точно и посчитаю, но потребуется немного времени.»
+
+ДОВЕРИЕ:
+- Сомнение в компании, «шарашка», «много вас таких» → покажи производство (SEND_PRODUCTION), факты: станки, 80–100 заказов/мес, срок 10–14 дней. Отстройка от Авито.
+- «А вдруг на замере накрутите?» → «Цена фиксируется после замера в договоре, аванс 70%. Лишнего не появится — что посчитали, то и делаем.»
+
+СЛОЖНЫЙ РАСКРОЙ / ТОЧНЫЙ РАСЧЁТ:
+- Если клиент хочет точную цену на сложный проект → «Стоимость предварительная, зависит от точного раскроя. Могу всё расчертить и посчитать точно — потребуется время.» Затем ALERT_MANAGER (зови на проверку раскроя).
+
+## Когда звать менеджера (ALERT_MANAGER) — бот замолкает, дальше ведёт человек
+Ставь ALERT_MANAGER в конце ответа (бот замолчит, подключится менеджер) если:
+- Клиент ерничает, грубит, троллит, агрессивен, пишет мат
+- Клиент прямо просит живого человека / «не хочу с ботом»
+- Жёсткий торг: клиент требует цену явно ниже разумного, давит на скидку
+- Горячий клиент готов к замеру / заказу прямо сейчас (нельзя упустить)
+- Клиент просит точный расчёт сложного проекта
+- Ты сам не понял запрос 2 раза подряд, диалог буксует
+Перед ALERT_MANAGER не отпугивай клиента — напиши короткую удерживающую фразу («Сейчас уточню детали и вернусь к вам с точным ответом») ИЛИ ничего, если менеджер сразу подхватит. Не прощайся, держи дверь открытой. Эти клиенты не всегда целевые, но их можно дожать — поэтому передаём живому менеджеру.
+
+## Автоматический расчёт сметы
+Когда ты собрал в диалоге всё нужное для расчёта (форма столешницы, размеры по стенам, камень, вырезы), вставь в ответ тег расчёта — система сама посчитает цену и подставит вместо тега. Формат:
+[CALC]{"shape":"г","g":{"A":2400,"B":1800},"depth":600,"stone":"Чёрное Море","cutouts":{"varka":1,"moyka":1,"smesitel":2},"edge_mp":5.0,"mont_mp":4.0}[/CALC]
+Поля:
+- shape: "прямая" или "г"
+- для прямой: "straight":[длины деталей], напр. [2800]
+- для Г: "g":{"A":стена1,"B":стена2}
+- depth: глубина (обычно 600, остров 700-1000)
+- stone: название камня как сказал клиент (можно артикул)
+- cutouts: {varka:кол-во, moyka:кол-во, smesitel:кол-во}
+- edge_mp: длина кромки в метрах (внешний контур: для Г = A+B+глубины)
+- mont_mp: метраж монтажа (= длина стен)
+Напиши подводку и поставь тег где должна быть цена, например: "Предварительная стоимость под ключ — [CALC]{...}[/CALC]. Это с учётом материала, изготовления, замера, доставки и установки. Расчёт предварительный, зависит от точного раскроя."
+ВАЖНО: перед расчётом подтверди камень. Если клиент назвал артикул (7570) или общее название (калакатта) — уточни конкретный камень и поверхность, прежде чем считать. Не считай по неясному камню.
+Тег CALC вставляй ТОЛЬКО когда есть форма, размеры, камень и вырезы. Если чего-то не хватает — сначала спроси.
+
 Когда клиент дал контакт, диалог завершён, или это дальний заказ — добавь в конце: SEND_SUMMARY
 Когда уместно показать производство (клиент сомневается, сравнивает с дешёвым конкурентом, просит фото цеха) — добавь в конце: SEND_PRODUCTION
 Когда клиент спрашивает как ухаживать за камнем — добавь в конце: SEND_CARE
@@ -275,6 +315,52 @@ function askClaude(messages) {
     req.end();
   });
 }
+
+function alertManager(clientId, session, reply) {
+  if (!MANAGER_CHAT_ID) return;
+  const name = session.clientName || `клиент ${clientId}`;
+  const clientMsgs = session.messages.filter(m => m.role === 'user');
+  const lastClient = clientMsgs.length ? clientMsgs[clientMsgs.length - 1].content : '';
+  const history = session.messages.slice(-8)
+    .map(m => `${m.role === 'user' ? '👤' : '🤖'} ${m.content.replace(/\[STAGE:\d+\]/g, '').replace(/[A-Z_]+MANAGER|SEND_\w+/g, '').trim()}`)
+    .join('\n');
+  const alert = `🚨 ТРЕБУЕТСЯ ВЫ — ${name}
+Последнее от клиента: "${lastClient}"
+
+${history}`;
+  bot.sendMessage(MANAGER_CHAT_ID, alert, {
+    reply_markup: {
+      inline_keyboard: [[
+        { text: `✍️ Ответить (${name})`, callback_data: `reply_${clientId}` },
+        { text: '▶️ Вернуть боту', callback_data: `resume_${clientId}` }
+      ]]
+    }
+  }).catch(console.error);
+}
+
+// Режим ответа менеджера: запоминаем какому клиенту менеджер сейчас пишет
+let managerReplyTarget = null;
+
+// Обработка нажатий кнопок
+bot.on('callback_query', async (q) => {
+  if (String(q.message.chat.id) !== String(MANAGER_CHAT_ID)) return;
+  const data = q.data || '';
+  if (data.startsWith('reply_')) {
+    const clientId = data.slice(6);
+    managerReplyTarget = clientId;
+    const cs = sessions[clientId];
+    const name = (cs && cs.clientName) || `клиент ${clientId}`;
+    await bot.answerCallbackQuery(q.id);
+    await bot.sendMessage(MANAGER_CHAT_ID, `✍️ Напишите ответ для: ${name}\n(следующее ваше сообщение уйдёт ему от имени бота)`);
+  } else if (data.startsWith('resume_')) {
+    const clientId = data.slice(7);
+    const cs = sessions[clientId];
+    if (cs) { cs.paused = false; cs.managerTook = false; }
+    if (managerReplyTarget === clientId) managerReplyTarget = null;
+    await bot.answerCallbackQuery(q.id, { text: 'Бот снова ведёт клиента' });
+    await bot.sendMessage(MANAGER_CHAT_ID, `▶️ Бот снова ведёт клиента ${clientId}`);
+  }
+});
 
 function sendSummaryToManager(session, allMessages) {
   if (!MANAGER_CHAT_ID) return;
@@ -373,20 +459,78 @@ bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
 
+  // ─── Команды менеджера (из личного чата владельца) ───────────────
+  if (MANAGER_CHAT_ID && String(chatId) === String(MANAGER_CHAT_ID) && text) {
+    // Режим ответа клиенту по кнопке: следующее сообщение уходит выбранному клиенту
+    if (managerReplyTarget && !text.startsWith('/')) {
+      const clientId = managerReplyTarget;
+      managerReplyTarget = null; // каждое сообщение требует нового нажатия — безопасность
+      try {
+        await bot.sendMessage(clientId, text);
+        const cs = sessions[clientId];
+        if (cs) cs.messages.push({ role: 'assistant', content: text });
+        const name = (cs && cs.clientName) || `клиент ${clientId}`;
+        await bot.sendMessage(MANAGER_CHAT_ID, `✓ отправлено: ${name}`, {
+          reply_markup: { inline_keyboard: [[
+            { text: `✍️ Ещё ответить (${name})`, callback_data: `reply_${clientId}` },
+            { text: '▶️ Вернуть боту', callback_data: `resume_${clientId}` }
+          ]]}
+        });
+      } catch (e) {
+        await bot.sendMessage(MANAGER_CHAT_ID, `✗ не удалось отправить: ${e.message}`);
+      }
+      return;
+    }
+    // /reply <id> <текст> — ответить клиенту от имени бота (бесшовно)
+    const mReply = text.match(/^\/reply\s+(\d+)\s+([\s\S]+)/);
+    if (mReply) {
+      const clientId = mReply[1];
+      const replyText = mReply[2];
+      try {
+        await bot.sendMessage(clientId, replyText);
+        // фиксируем в истории клиента как сообщение ассистента
+        const cs = sessions[clientId];
+        if (cs) cs.messages.push({ role: 'assistant', content: replyText });
+        await bot.sendMessage(MANAGER_CHAT_ID, `✓ отправлено клиенту ${clientId}`);
+      } catch (e) {
+        await bot.sendMessage(MANAGER_CHAT_ID, `✗ не удалось отправить: ${e.message}`);
+      }
+      return;
+    }
+    // /resume <id> — вернуть автопилот по клиенту
+    const mResume = text.match(/^\/resume\s+(\d+)/);
+    if (mResume) {
+      const cs = sessions[mResume[1]];
+      if (cs) { cs.paused = false; cs.managerTook = false; }
+      await bot.sendMessage(MANAGER_CHAT_ID, `▶ бот снова ведёт клиента ${mResume[1]}`);
+      return;
+    }
+    // /take <id> — забрать клиента себе (пауза бота до конца)
+    const mTake = text.match(/^\/take\s+(\d+)/);
+    if (mTake) {
+      const cs = sessions[mTake[1]];
+      if (cs) { cs.paused = true; cs.managerTook = true; }
+      await bot.sendMessage(MANAGER_CHAT_ID, `⏸ вы ведёте клиента ${mTake[1]}, бот молчит`);
+      return;
+    }
+  }
+
   if (text === '/start') {
     console.log(`/start от chat_id: ${chatId}`);
   }
 
   const session = getSession(chatId);
+  // запоминаем имя клиента из Telegram для кнопок менеджера
+  if (!session.clientName && msg.from) {
+    session.clientName = [msg.from.first_name, msg.from.last_name].filter(Boolean).join(' ') || (msg.from.username ? '@'+msg.from.username : null) || `клиент ${chatId}`;
+  }
 
   // Клиент написал — сбрасываем таймер подогрева и счётчик
   if (session.warmTimer) { clearTimeout(session.warmTimer); session.warmTimer = null; }
   session.warmCount = 0;
 
-  // Менеджер ставит диалог на паузу командой /stop, возвращает /resume
-  if (text === '/stop') { session.paused = true; await bot.sendMessage(chatId, '(бот на паузе)'); return; }
-  if (text === '/resume') { session.paused = false; await bot.sendMessage(chatId, '(бот снова отвечает)'); return; }
-  if (session.paused) return;
+  // Если менеджер забрал клиента — бот молчит
+  if (session.managerTook || session.paused) return;
 
   // Приём фото — скачиваем и отправляем в Claude для распознавания
   if (msg.photo) {
@@ -456,16 +600,54 @@ bot.on('message', async (msg) => {
       sendEdges(chatId, 'kvarc');
     }
 
+    // Тревога: бот зовёт менеджера и замолкает по этому клиенту
+    if (reply.includes('ALERT_MANAGER')) {
+      session.paused = true;
+      session.managerTook = true;
+      alertManager(chatId, session, reply);
+    }
+
+    // Расчёт сметы: модель вставила [CALC]{...}[/CALC] — считаем и подставляем цену
+    let calcInsert = '';
+    const calcMatch = reply.match(/\[CALC\]([\s\S]*?)\[\/CALC\]/);
+    if (calcMatch) {
+      try {
+        const params = JSON.parse(calcMatch[1].trim());
+        const est = await calc.estimateProject(params);
+        if (est.error) {
+          calcInsert = '';
+          console.log('CALC error:', est.error);
+        } else {
+          const lo = est.total[0], hi = est.total[1];
+          const priceStr = (lo === hi)
+            ? `*${lo.toLocaleString('ru-RU')} ₽*`
+            : `*${lo.toLocaleString('ru-RU')}–${hi.toLocaleString('ru-RU')} ₽*`;
+          calcInsert = priceStr;
+          // внутренняя сводка менеджеру: раскрой, прибыль
+          if (MANAGER_CHAT_ID) {
+            const summary = `💰 Расчёт для ${session.clientName || chatId}\n` +
+              `Раскрой: ${est.cut.desc} (увер. ${Math.round(est.confidence*100)}%)\n` +
+              `Цена клиенту: ${lo===hi?lo:lo+'–'+hi} ₽\n` +
+              `Грязная прибыль: ${est.profit.toLocaleString('ru-RU')} ₽ (${est.profitPct}%)`;
+            bot.sendMessage(MANAGER_CHAT_ID, summary).catch(()=>{});
+          }
+        }
+      } catch (e) { console.log('CALC parse fail:', e.message); }
+    }
+
     const clean = reply
       .replace(/\[STAGE:\d+\]/g, '')
+      .replace(/\[CALC\][\s\S]*?\[\/CALC\]/, calcInsert)
       .replace('SEND_SUMMARY', '')
       .replace('SEND_PRODUCTION', '')
       .replace('SEND_CARE', '')
       .replace('SEND_EDGES_AKRIL', '')
       .replace('SEND_EDGES', '')
+      .replace('ALERT_MANAGER', '')
       .replace(/\|\|\|\s*$/, '')
       .trim();
-    await sendSplit(chatId, clean);
+    // Если был алерт и бот ничего осмысленного не написал — не шлём пустоту клиенту
+    if (clean) await sendSplit(chatId, clean);
 
     // Если клиент дал номер или речь зашла о звонке — отключаем подогрев (менеджер свяжется сам)
     const phoneRe = /\+?[78][\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}/;
