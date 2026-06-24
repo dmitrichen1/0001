@@ -70,6 +70,7 @@ const NOISE_WORDS = ['аварус','авант','авангард','нобл','
   'глянец','глянцевый','матовый','мат','полированный','камень','столешница','коллекция','авант кварц','avarus','avant'];
 function findStone(query) {
   let q = normalize(query);
+  if (!q) return []; // пустой запрос — ничего
   // прямое совпадение
   let result = PRICE.filter(p =>
     normalize(p.name).includes(q) || normalize(p.article).includes(q) || normalize(p.brand).includes(q)
@@ -205,6 +206,19 @@ function identifyStone(query) {
   };
 }
 
+// Самый дешёвый камень из наличия (для расчёта "от", когда клиент не выбрал)
+function cheapestStone(surface = 'глянцевый') {
+  const cands = PRICE.filter(p => p.surface === surface && p.price_sheet && (p.stock !== 'под заказ'));
+  if (!cands.length) return null;
+  // приводим к рублям грубо для сравнения (USD дешевле EUR)
+  cands.sort((a, b) => {
+    const ka = a.currency === '€' ? 1.15 : 1;
+    const kb = b.currency === '€' ? 1.15 : 1;
+    return a.price_sheet * ka - b.price_sheet * kb;
+  });
+  return cands[0];
+}
+
 async function stoneFormats(query, surface = 'глянцевый') {
   let matches = findStone(query);
   if (!matches.length) return null;
@@ -241,8 +255,23 @@ async function stoneFormats(query, surface = 'глянцевый') {
 //   moscow: true,
 // }
 async function estimateProject(project) {
-  const formats = await stoneFormats(project.stone);
-  if (!formats) return { error: `Камень "${project.stone}" не найден в прайсе` };
+  let formats = null;
+  let priceFrom = false;
+  let usedStone = project.stone;
+  // если камень указан — пробуем найти
+  if (project.stone && String(project.stone).trim()) {
+    formats = await stoneFormats(project.stone);
+  }
+  if (!formats) {
+    // камень не назван или не из прайса — берём самый дешёвый, считаем "от"
+    const cheap = cheapestStone(project.surface || 'глянцевый');
+    if (cheap) {
+      formats = await stoneFormats(cheap.name, cheap.surface);
+      priceFrom = true;
+      usedStone = `${cheap.brand} ${cheap.name}`;
+    }
+  }
+  if (!formats) return { error: `Не удалось подобrать камень для расчёта` };
 
   // 1. РАСКРОЙ
   const depth = project.depth || 600;
@@ -297,7 +326,7 @@ async function estimateProject(project) {
     total: [totalMin, totalMax],
     confidence: cut.confidence,
     profit: Math.round(profit), profitPct: +profitPct.toFixed(1),
-    lines,
+    lines, priceFrom, usedStone,
   };
 }
 
