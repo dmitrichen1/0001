@@ -237,33 +237,50 @@ async function stoneFormats(query, surface = 'глянцевый') {
     const rate = await workingRate(m.currency);
     const priceFull = Math.ceil(m.price_sheet * rate * MARKUP / 100) * 100;
     const priceHalf = Math.ceil((m.price_sheet * 0.5 * rate * MARKUP + CUT_HALF * MARKUP) / 100) * 100;
-    out.push({ ...dims, price: priceFull, priceHalf, usd: m.price_sheet, currency: m.currency, stoneName: m.name, brand: m.brand });
+    const areaM2 = (m.w * m.h) / 1e6;
+    const costPerM2 = areaM2 ? (m.price_sheet * rate) / areaM2 : 0; // себестоимость камня за м² в ₽ (без навара)
+    out.push({ ...dims, price: priceFull, priceHalf, usd: m.price_sheet, currency: m.currency,
+               stoneName: m.name, brand: m.brand, sheetAreaM2: areaM2, costPerM2 });
   }
   return out.length ? out : null;
 }
 
-// ─── ПОЛНАЯ СМЕТА ПРОЕКТА ────────────────────────────────────────
+// ─── ПОЛНАЯ СМЕТА ПРОЕКТА (модель «площадь × коэффициент») ────────
 // project = {
-//   shape: 'прямая'|'г',
-//   straight: [длины деталей],   // для прямой
-//   g: {A, B},                    // для Г (стены)
-//   depth: 600,
-//   stone: 'Чёрное Море',
-//   cutouts: { varka:1, moyka:1, smesitel:2 },  // вырезы
-//   edge_mp: 4.0,                 // кромка м.п.
-//   mont_mp: 4.0,                 // монтаж м.п.
-//   moscow: true,
+//   details: [{ len, depth }],   // ВСЕ детали плоским списком (столешница + панели)
+//   stone: 'Чёрное Море',        // камень (или пусто → дешёвый, цена "от")
+//   surface: 'глянцевый',
+//   cutouts: { varka:1, moyka:1, smesitel:2 },
+//   edge_mp: 4.0,                 // кромка м.п. (внешний контур)
+//   mont_mp: 4.0,                 // монтаж м.п. (длина по стенам)
+//   panels_mp: 2.7,              // ПОГ.МЕТРЫ стеновых панелей (длина+высота), для работ по панелям
 // }
+// Совместимость: если переданы straight[]/g{} — приводим к details[].
+const CUT_COEF = 1.35;   // коэффициент раскроя: площадь деталей × 1.35 = м² камня к закупке
+
+function projectToDetails(project) {
+  const depth = project.depth || 600;
+  if (Array.isArray(project.details) && project.details.length) {
+    return project.details.map(d => ({ len: d.len, depth: d.depth || depth }));
+  }
+  // обратная совместимость со старым форматом
+  if (project.shape === 'г' && project.g) {
+    return [{ len: project.g.A, depth }, { len: project.g.B, depth }];
+  }
+  if (Array.isArray(project.straight)) {
+    return project.straight.map(len => ({ len, depth }));
+  }
+  return [];
+}
+
 async function estimateProject(project) {
   let formats = null;
   let priceFrom = false;
   let usedStone = project.stone;
-  // если камень указан — пробуем найти
   if (project.stone && String(project.stone).trim()) {
-    formats = await stoneFormats(project.stone);
+    formats = await stoneFormats(project.stone, project.surface || 'глянцевый');
   }
   if (!formats) {
-    // камень не назван или не из прайса — берём самый дешёвый, считаем "от"
     const cheap = cheapestStone(project.surface || 'глянцевый');
     if (cheap) {
       formats = await stoneFormats(cheap.name, cheap.surface);
@@ -271,22 +288,59 @@ async function estimateProject(project) {
       usedStone = `${cheap.brand} ${cheap.name}`;
     }
   }
-  if (!formats) return { error: `Не удалось подобrать камень для расчёта` };
+  if (!formats || !formats.length) return { error: 'Не удалось подобрать камень для расчёта' };
 
-  // 1. РАСКРОЙ
-  const depth = project.depth || 600;
-  let cut;
-  if (project.shape === 'г' && project.g) {
-    cut = raskroy.bestCutG(project.g.A, project.g.B, depth, 'medium', formats);
+  // Берём самый дешёвый доступный формат камня как основной для расчёта
+  const fmt = formats.slice().sort((a, b) => a.price - b.price)[0];
+
+  // 1. ДЕТАЛИ И ПЛОЩАДЬ
+  const details = projectToDetails(project);
+  if (!details.length) return { error: 'Нет деталей для расчёта' };
+
+  const detailAreaM2 = details.reduce((s, d) => s + (d.len * d.depth) / 1e6, 0);
+  const stoneAreaM2  = detailAreaM2 * CUT_COEF;           // площадь камня к закупке
+  const longest      = Math.max(...details.map(d => d.len));
+  const sheetArea    = fmt.sheetAreaM2 || (fmt.L * fmt.W / 1e6);
+  const halfArea     = sheetArea / 2;
+
+  // 2. ЛИСТЫ + ВИЛКА (детерминированное правило, без «вероятностей»)
+  // Проверки габарита: влезает ли длинная деталь в половину листа / целый лист
+  const fitsHalf  = longest <= fmt.L && (fmt.Whalf ? d_fits(details, fmt.L, fmt.Whalf) : false);
+  const fitsFull  = longest <= fmt.L;
+
+  let matMin, matMax, sheetsDesc, confidence;
+
+  const multiDetail = details.length >= 2;
+  const nearLimit = stoneAreaM2 > sheetArea * 0.8; // близко к ёмкости листа
+
+  if (stoneAreaM2 <= halfArea && fitsHalf) {
+    // уверенно половинка
+    matMin = matMax = fmt.priceHalf;
+    sheetsDesc = '½ листа';
+    confidence = 0.9;
+  } else if (stoneAreaM2 <= sheetArea && fitsFull) {
+    // помещается в один лист по площади
+    if (stoneAreaM2 <= halfArea * 1.1 && fitsHalf) {
+      // граница ½…1
+      matMin = fmt.priceHalf; matMax = fmt.price;
+      sheetsDesc = '½–1 лист'; confidence = 0.7;
+    } else if (multiDetail && nearLimit) {
+      // 2+ деталей на грани листа — раскладка ненадёжна, страхуем вилкой 1…2 листа
+      matMin = fmt.price; matMax = fmt.price + fmt.priceHalf;
+      sheetsDesc = '1–1.5 листа'; confidence = 0.55;
+    } else {
+      matMin = matMax = fmt.price;
+      sheetsDesc = '1 лист'; confidence = 0.85;
+    }
   } else {
-    const details = (project.straight || []).map(len => ({ len, depth }));
-    cut = raskroy.bestCut(details, 'simple', formats);
+    // нужно больше листа: целое число вверх + вилка от (N-0.5) листа
+    const fullSheets = Math.ceil(stoneAreaM2 / sheetArea);
+    const withHalf   = Math.max(0, fullSheets - 1) * fmt.price + fmt.priceHalf;
+    matMin = Math.min(withHalf, fullSheets * fmt.price);
+    matMax = fullSheets * fmt.price;
+    sheetsDesc = matMin === matMax ? `${fullSheets} листа` : `${fullSheets - 0.5}–${fullSheets} листа`;
+    confidence = 0.6;
   }
-  if (!cut) return { error: 'Раскрой не удался — проверьте размеры' };
-
-  // 2. МАТЕРИАЛ — цена из раскроя (уже с курсом и наваром)
-  const materialMin = cut.range[0];
-  const materialMax = cut.range[1];
 
   // 3. РАБОТЫ
   const wt = (name) => { const x = work(name); return x ? x.total : 0; };
@@ -312,22 +366,46 @@ async function estimateProject(project) {
   const montMp = project.mont_mp || 0;
   if (edgeMp) addW(`Кромка ${edgeMp} м.п.`, Math.round(wt('Профиль 1, Z, R') * edgeMp), Math.round(wc('Профиль 1, Z, R') * edgeMp));
   if (montMp) addW(`Монтаж ${montMp} м.п.`, Math.round(wt('Установка подоконников') * montMp), Math.round(wc('Установка подоконников') * montMp));
+
+  // Стеновые панели: работы по метражу (длина+высота). Материал уже учтён в площади details.
+  const panelsMp = project.panels_mp || 0;
+  if (panelsMp) {
+    addW(`Панели: изготовление ${panelsMp} м.п.`,
+      Math.round(wt('Изготовление стеновой панели') * panelsMp),
+      Math.round(wc('Изготовление стеновой панели') * panelsMp));
+    addW(`Панели: установка ${panelsMp} м.п.`,
+      Math.round(wt('Установка стеновой панели') * panelsMp),
+      Math.round(wc('Установка стеновой панели') * panelsMp));
+  }
+
   addW('Доставка на объект', wt('Доставка / повторная доставка'), wc('Доставка / повторная доставка'));
 
-  // 4. ИТОГ + грязная прибыль (материал: себестоимость без навара)
-  const matCostMin = Math.round(materialMin / MARKUP); // обратно к себестоимости камня
-  const totalMin = materialMin + worksSum;
-  const totalMax = materialMax + worksSum;
-  const profit = (totalMin) - (matCostMin + worksCost);
+  // 4. ИТОГ + грязная прибыль
+  // Себестоимость материала: площадь камня × себестоимость за м² (без навара)
+  const matCost = Math.round(stoneAreaM2 * (fmt.costPerM2 || 0));
+  const totalMin = matMin + worksSum;
+  const totalMax = matMax + worksSum;
+  const profit = totalMin - (matCost + worksCost);
   const profitPct = totalMin ? (profit / totalMin * 100) : 0;
 
   return {
-    cut, material: [materialMin, materialMax], works: worksSum,
+    material: [matMin, matMax],
+    works: worksSum,
     total: [totalMin, totalMax],
-    confidence: cut.confidence,
-    profit: Math.round(profit), profitPct: +profitPct.toFixed(1),
+    confidence,
+    cut: { desc: `${sheetsDesc} (${detailAreaM2.toFixed(2)}м²×${CUT_COEF}=${stoneAreaM2.toFixed(2)}м²)`, confidence },
+    profit: Math.round(profit),
+    profitPct: +profitPct.toFixed(1),
     lines, priceFrom, usedStone,
   };
+}
+
+// Помощь: влезают ли все детали в полосы шириной maxW и длиной maxL (грубая проверка по габариту)
+function d_fits(details, maxL, maxW) {
+  // каждая деталь должна влезать хотя бы по одной ориентации
+  return details.every(d =>
+    (d.len <= maxL && d.depth <= maxW) || (d.depth <= maxL && d.len <= maxW)
+  );
 }
 
 module.exports = {
